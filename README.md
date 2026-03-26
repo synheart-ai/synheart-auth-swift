@@ -48,7 +48,7 @@ print("Device ID: \(result.deviceId ?? "N/A")")
 let headers = try SynheartAuth.shared.signRequest(
     appId: "com.myapp",
     method: "POST",
-    path: "/v1/ingest/hsi",
+    path: "/ingest/v1/hsi",
     bodyBytes: bodyData
 )
 // Apply headers.appId, headers.deviceId, headers.signature, etc.
