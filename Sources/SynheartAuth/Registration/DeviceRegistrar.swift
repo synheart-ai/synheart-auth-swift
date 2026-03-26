@@ -26,7 +26,7 @@ final class DeviceRegistrar: @unchecked Sendable {
     ///
     /// 1. Fetch challenge from server
     /// 2. Generate key pair in Secure Enclave
-    /// 3. Request App Attest attestation (if available)
+    /// 3. Request App Attest proof (if available)
     /// 4. Send register request to server
     /// 5. Store device ID and update state
     /// 6. Return result
@@ -56,11 +56,16 @@ final class DeviceRegistrar: @unchecked Sendable {
             let publicKeyData = try keyManager.generateKeyPair(appId: appId)
             try storage.saveState(.keyReady, appId: appId)
 
-            // Step 3: App Attest (best-effort)
-            let attestation = await fetchAttestation(
+            // Step 3: App Attest proof (best-effort)
+            let publicKeyBase64 = publicKeyData.base64EncodedString()
+            let proof = await fetchAttestation(
                 challenge: challengeResponse.challenge,
+                publicKey: publicKeyBase64,
                 appId: appId
             )
+
+            // Generate or reuse device ID
+            let deviceId = storage.loadDeviceId(appId: appId) ?? UUID().uuidString
 
             // Step 4: Register with server
             logger.info("Step 4/6: Registering with server")
@@ -68,10 +73,11 @@ final class DeviceRegistrar: @unchecked Sendable {
 
             let request = RegisterRequest(
                 appId: appId,
+                deviceId: deviceId,
                 challenge: challengeResponse.challenge,
-                publicKey: publicKeyData.base64EncodedString(),
-                attestation: attestation,
-                deviceMetadata: buildDeviceMetadata()
+                publicKey: publicKeyBase64,
+                platform: "ios",
+                proof: proof ?? "none"
             )
 
             let response = try await network.registerDevice(request: request)
@@ -164,7 +170,7 @@ final class DeviceRegistrar: @unchecked Sendable {
 
     // MARK: - App Attest
 
-    private func fetchAttestation(challenge: String, appId: String) async -> String? {
+    private func fetchAttestation(challenge: String, publicKey: String, appId: String) async -> String? {
         #if canImport(DeviceCheck) && !targetEnvironment(simulator)
         guard DCAppAttestService.shared.isSupported else {
             logger.warning("App Attest not supported on this device")
@@ -173,8 +179,10 @@ final class DeviceRegistrar: @unchecked Sendable {
 
         do {
             let keyId = try await DCAppAttestService.shared.generateKey()
-            let challengeHash = Data(SHA256.hash(data: Data(challenge.utf8)))
-            let attestation = try await DCAppAttestService.shared.attestKey(keyId, clientDataHash: challengeHash)
+            // Nonce = SHA256(challenge + public_key) per attestation flow spec
+            let nonceInput = challenge + publicKey
+            let nonce = Data(SHA256.hash(data: Data(nonceInput.utf8)))
+            let attestation = try await DCAppAttestService.shared.attestKey(keyId, clientDataHash: nonce)
             return attestation.base64EncodedString()
         } catch {
             logger.warning("App Attest failed (non-fatal): \(error.localizedDescription)")
@@ -184,35 +192,5 @@ final class DeviceRegistrar: @unchecked Sendable {
         logger.info("App Attest not available (simulator/macOS)")
         return nil
         #endif
-    }
-
-    // MARK: - Device Metadata
-
-    private func buildDeviceMetadata() -> DeviceMetadata {
-        let osVersion: String
-        let model: String
-        let secureEnclave: Bool
-
-        #if os(iOS)
-        osVersion = UIDevice.current.systemVersion
-        model = UIDevice.current.model
-        #else
-        let processInfo = ProcessInfo.processInfo
-        osVersion = processInfo.operatingSystemVersionString
-        model = "Mac"
-        #endif
-
-        #if targetEnvironment(simulator)
-        secureEnclave = false
-        #else
-        secureEnclave = true
-        #endif
-
-        return DeviceMetadata(
-            platform: "iOS",
-            osVersion: osVersion,
-            model: model,
-            secureEnclave: secureEnclave
-        )
     }
 }
