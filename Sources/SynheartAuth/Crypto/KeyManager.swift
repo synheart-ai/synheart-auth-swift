@@ -40,11 +40,11 @@ final class KeyManager: KeyManaging, @unchecked Sendable {
     }
 
     private func tag(appId: String) -> String {
-        "com.synheart.auth.\(appId)"
+        "ai.synheart.auth.\(appId)"
     }
 
     private func nextTag(appId: String) -> String {
-        "com.synheart.auth.\(appId)_next"
+        "ai.synheart.auth.\(appId)_next"
     }
 
     // MARK: - Key Generation
