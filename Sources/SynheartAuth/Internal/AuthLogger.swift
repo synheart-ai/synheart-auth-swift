@@ -8,7 +8,7 @@ struct AuthLogger {
     static let shared = AuthLogger()
 
     private init() {
-        self.logger = Logger(subsystem: "com.synheart.auth", category: "SynheartAuth")
+        self.logger = Logger(subsystem: "ai.synheart.auth", category: "SynheartAuth")
     }
 
     func debug(_ message: String) {

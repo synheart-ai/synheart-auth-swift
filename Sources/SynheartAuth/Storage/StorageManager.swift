@@ -14,7 +14,7 @@ protocol StorageManaging: Sendable {
 
 /// Keychain-backed persistent storage for device auth data.
 final class StorageManager: StorageManaging, @unchecked Sendable {
-    static let serviceName = "com.synheart.auth"
+    static let serviceName = "ai.synheart.auth"
 
     private let logger = AuthLogger.shared
 
