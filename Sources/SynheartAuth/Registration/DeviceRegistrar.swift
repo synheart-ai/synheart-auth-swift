@@ -179,10 +179,18 @@ final class DeviceRegistrar: @unchecked Sendable {
 
         do {
             let keyId = try await DCAppAttestService.shared.generateKey()
-            // Nonce = SHA256(challenge + public_key) per attestation flow spec
-            let nonceInput = challenge + publicKey
-            let nonce = Data(SHA256.hash(data: Data(nonceInput.utf8)))
-            let attestation = try await DCAppAttestService.shared.attestKey(keyId, clientDataHash: nonce)
+            // The auth-service binds the attestation to (challenge, public_key) using:
+            // bindingHex = hex(SHA256(challenge || public_key))  // 64-char lowercase hex string
+            // clientDataHash = SHA256(utf8(bindingHex))          // 32 bytes
+            let bindingInput = challenge + publicKey
+            let bindingDigest = SHA256.hash(data: Data(bindingInput.utf8))
+            let bindingHex = bindingDigest.compactMap { String(format: "%02x", $0) }.joined()
+            let clientDataHash = Data(SHA256.hash(data: Data(bindingHex.utf8)))
+
+            let attestation = try await DCAppAttestService.shared.attestKey(
+                keyId,
+                clientDataHash: clientDataHash
+            )
             return attestation.base64EncodedString()
         } catch {
             logger.warning("App Attest failed (non-fatal): \(error.localizedDescription)")

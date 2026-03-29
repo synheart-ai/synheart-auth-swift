@@ -46,7 +46,7 @@ final class DeviceRegistrarTests: XCTestCase {
         XCTAssertEqual(network.lastRegisterRequest?.appId, appId)
         XCTAssertEqual(network.lastRegisterRequest?.challenge, "test-challenge-abc")
         XCTAssertNotNil(network.lastRegisterRequest?.publicKey)
-        XCTAssertNotNil(network.lastRegisterRequest?.deviceMetadata)
+        XCTAssertNotNil(network.lastRegisterRequest?.deviceId)
     }
 
     // MARK: - Already Registered
