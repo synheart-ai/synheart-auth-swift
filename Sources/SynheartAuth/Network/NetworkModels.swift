@@ -50,6 +50,13 @@ struct ChallengeResponse: Codable {
         case expiresAt = "expires_at"
     }
 
+    /// Check if the challenge has expired based on expiresAt timestamp.
+    var isExpired: Bool {
+        let formatter = ISO8601DateFormatter()
+        guard let date = formatter.date(from: expiresAt) else { return false }
+        return date < Date()
+    }
+
     /// Parse from API envelope or flat response
     static func fromApiData(_ data: Data) throws -> ChallengeResponse {
         let decoder = JSONDecoder()
@@ -62,7 +69,7 @@ struct ChallengeResponse: Codable {
             } else if let ei = payload.expiresIn {
                 expiresAt = ISO8601DateFormatter().string(from: Date().addingTimeInterval(TimeInterval(ei)))
             } else {
-                expiresAt = ISO8601DateFormatter().string(from: Date().addingTimeInterval(300))
+                expiresAt = ISO8601DateFormatter().string(from: Date().addingTimeInterval(90)) // RFC default: 90s
             }
             return ChallengeResponse(challenge: payload.challenge, expiresAt: expiresAt)
         }

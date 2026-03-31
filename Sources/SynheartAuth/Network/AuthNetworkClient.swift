@@ -53,6 +53,9 @@ final class AuthNetworkClient: AuthNetworking, @unchecked Sendable {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        #if DEBUG
+        request.setValue("true", forHTTPHeaderField: "X-Synheart-Dev-Mode")
+        #endif
         request.httpBody = try encoder.encode(body)
 
         let (data, response) = try await performRequest(request)
@@ -79,6 +82,9 @@ final class AuthNetworkClient: AuthNetworking, @unchecked Sendable {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        #if DEBUG
+        request.setValue("true", forHTTPHeaderField: "X-Synheart-Dev-Mode")
+        #endif
         request.httpBody = try encoder.encode(body)
 
         let (data, response) = try await performRequest(request)

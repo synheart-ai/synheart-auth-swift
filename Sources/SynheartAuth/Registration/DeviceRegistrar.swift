@@ -46,10 +46,17 @@ final class DeviceRegistrar: @unchecked Sendable {
         }
 
         do {
-            // Step 1: Fetch challenge
+            // Step 1: Fetch challenge (with retry)
             logger.info("Step 1/6: Fetching challenge for \(appId)")
-            let challengeResponse = try await network.fetchChallenge(appId: appId)
+            let challengeResponse = try await withRetry { [network] in
+                try await network.fetchChallenge(appId: appId)
+            }
             try storage.saveState(.challengeReceived, appId: appId)
+
+            // Validate challenge hasn't expired (90s TTL per RFC)
+            if challengeResponse.isExpired {
+                throw SynheartAuthError.challengeExpired
+            }
 
             // Step 2: Generate key pair
             logger.info("Step 2/6: Generating key pair")
@@ -80,7 +87,9 @@ final class DeviceRegistrar: @unchecked Sendable {
                 proof: proof ?? "none"
             )
 
-            let response = try await network.registerDevice(request: request)
+            let response = try await withRetry { [network] in
+                try await network.registerDevice(request: request)
+            }
 
             // Step 5: Store result
             logger.info("Step 5/6: Storing device ID: \(response.deviceId)")
@@ -142,7 +151,9 @@ final class DeviceRegistrar: @unchecked Sendable {
                 oldKeySignature: oldKeySignature.base64EncodedString()
             )
 
-            let response = try await network.rotateKey(request: request)
+            let response = try await withRetry { [network] in
+                try await network.rotateKey(request: request)
+            }
 
             guard response.status == "ok" || response.status == "success" else {
                 throw SynheartAuthError.serverError(code: "ROTATION_FAILED", message: response.status)
@@ -166,6 +177,49 @@ final class DeviceRegistrar: @unchecked Sendable {
             }
             return RotationResult(status: .failed, error: .networkError(error.localizedDescription))
         }
+    }
+
+    // MARK: - Retry
+
+    /// Retry an async operation with exponential backoff and jitter.
+    /// - Parameters:
+    ///   - maxAttempts: Maximum number of attempts (default 5 per RFC-AUTH-MOBILE-0001 §12)
+    ///   - operation: The async throwing operation to retry
+    /// - Returns: The result of the first successful attempt
+    /// - Throws: The last error if all attempts fail
+    private func withRetry<T>(maxAttempts: Int = 5, _ operation: () async throws -> T) async throws -> T {
+        var lastError: Error?
+        for attempt in 0..<maxAttempts {
+            do {
+                return try await operation()
+            } catch {
+                lastError = error
+                // Don't retry on client errors (4xx) or known non-transient errors
+                if let authError = error as? SynheartAuthError {
+                    switch authError {
+                    case .challengeExpired, .notRegistered, .notConfigured,
+                         .alreadyRegistered, .registrationInProgress,
+                         .invalidStateTransition, .keyInvalidated:
+                        throw error // Non-retryable
+                    case .serverError(let code, _):
+                        // 4xx errors from server are client errors — don't retry
+                        if code.hasPrefix("4") { throw error }
+                    default:
+                        break // Retryable (network, crypto, etc.)
+                    }
+                }
+
+                if attempt < maxAttempts - 1 {
+                    // Exponential backoff: min(1s * 2^attempt + jitter, 30s)
+                    let baseDelay: Double = 1.0 * pow(2.0, Double(attempt))
+                    let jitter = Double.random(in: 0...0.5)
+                    let delay = min(baseDelay + jitter, 30.0)
+                    logger.info("Retry \(attempt + 1)/\(maxAttempts - 1) after \(String(format: "%.1f", delay))s")
+                    try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                }
+            }
+        }
+        throw lastError!
     }
 
     // MARK: - App Attest
