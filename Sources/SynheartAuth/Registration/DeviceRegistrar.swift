@@ -52,6 +52,7 @@ final class DeviceRegistrar: @unchecked Sendable {
                 try await network.fetchChallenge(appId: appId)
             }
             try storage.saveState(.challengeReceived, appId: appId)
+            logger.info("Challenge received: \(challengeResponse.challenge) expiresAt=\(challengeResponse.expiresAt)")
 
             // Validate challenge hasn't expired (90s TTL per RFC)
             if challengeResponse.isExpired {
@@ -65,6 +66,7 @@ final class DeviceRegistrar: @unchecked Sendable {
 
             // Step 3: App Attest proof (best-effort)
             let publicKeyBase64 = publicKeyData.base64EncodedString()
+            logger.info("Public key generated: bytes=\(publicKeyData.count) base64=\(publicKeyBase64)")
             let proof = await fetchAttestation(
                 challenge: challengeResponse.challenge,
                 publicKey: publicKeyBase64,
