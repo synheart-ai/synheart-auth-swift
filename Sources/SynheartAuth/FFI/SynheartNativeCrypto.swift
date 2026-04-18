@@ -15,9 +15,8 @@ private let ffiLog = Logger(subsystem: "ai.synheart.auth", category: "SynheartFF
 ///
 /// Return contracts (Rust frees with `CString::from_raw`, i.e. system free):
 /// - `generate_key` → JSON `{"x":"<b64url>","y":"<b64url>"}`
-/// - `sign_bytes`   → base64url(ASN.1 DER ECDSA-Sig-Value) — the server
-///   (auth-service `verifyClientDataSignature` → `ecdsa.VerifyASN1`) expects
-///   DER, not raw r||s.
+/// - `sign_bytes`   → base64url(raw 64-byte r||s) — Rust FFI bridge expects
+///   compact form, then converts to DER before sending to the server.
 /// - `get_attestation` → JSON `{"format":"apple-app-attest","blob":"<b64>"}` or null
 /// - `key_exists`, `delete_key` → i32 (1/0 for exists, 0=ok / nonzero=err for delete)
 
@@ -151,31 +150,21 @@ public func synheart_native_sign_bytes(
     _ dataLen: Int
 ) -> UnsafeMutablePointer<CChar>? {
     guard let deviceId, let id = String(validatingUTF8: deviceId),
-          let data, dataLen == 32 else { return nil }
+          let data, dataLen > 0 else { return nil }
     guard let key = loadEnclaveKey(deviceId: id) else {
         ffiLog.error("[SynheartFFI] sign: no SE key for id=\(id, privacy: .public)")
         return nil
     }
-    var digestBytes = [UInt8](repeating: 0, count: 32)
-    for k in 0..<32 { digestBytes[k] = data[k] }
     do {
-        // The Rust core passes a precomputed SHA-256 of canonical client_data.
-        // We need to sign these 32 bytes AS the digest (no rehashing).
-        // CryptoKit's `signature(for: D) where D: Digest` does exactly that,
-        // but `SHA256Digest` has no public initializer from raw bytes. We
-        // construct one by overwriting the internal 32-byte storage of an
-        // arbitrary `SHA256.hash(data:)` result. SHA256Digest is a value type
-        // wrapping 32 raw bytes, so this layout overwrite is well-defined.
-        var digest = SHA256.hash(data: Data())
-        withUnsafeMutableBytes(of: &digest) { dst in
-            digestBytes.withUnsafeBytes { src in
-                _ = dst.copyBytes(from: src.prefix(min(dst.count, src.count)))
-            }
-        }
+        // Rust passes raw signing input (variable length). Hash it with
+        // SHA-256 first, matching the software_bridge behaviour, then sign
+        // the resulting digest with the Secure Enclave key.
+        let inputData = Data(bytes: data, count: dataLen)
+        let digest = SHA256.hash(data: inputData)
         let sig = try key.signature(for: digest)
-        // Server (auth-service device_usecase.go) verifies via Go's
-        // `ecdsa.VerifyASN1`, which expects ASN.1 DER, not raw r||s.
-        return cString(base64Url(sig.derRepresentation))
+        // Rust FFI bridge expects raw 64-byte r||s (compact), then
+        // converts to DER itself before sending to the server.
+        return cString(base64Url(sig.rawRepresentation))
     } catch {
         ffiLog.error("[SynheartFFI] sign: SE sign failed: \(error.localizedDescription, privacy: .public)")
         return nil
