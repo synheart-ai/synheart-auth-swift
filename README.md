@@ -1,3 +1,5 @@
+🌐 Official website: [synheart.ai](https://synheart.ai) — Human State Interface (HSI) infrastructure for developers and AI systems.
+
 # SynheartAuth (Swift)
 
 [![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](https://github.com/synheart-ai/synheart-auth-swift)
