@@ -11,7 +11,11 @@ Pod::Spec.new do |s|
   s.homepage         = 'https://github.com/synheart-ai/synheart-auth-swift'
   s.license          = { :type => 'Apache-2.0', :file => 'LICENSE' }
   s.author           = 'Synheart'
-  s.source           = { :git => 'https://github.com/synheart-ai/synheart-auth-swift.git', :tag => s.version.to_s }
+  # The actual git tag carries a `v` prefix (e.g. `v0.1.0`). Hard-pin the
+  # prefix here so `:tag` resolves to a tag that actually exists; relying on
+  # `s.version.to_s` alone would point at a non-existent `0.1.0` tag and
+  # break `pod trunk push` / `pod install`.
+  s.source           = { :git => 'https://github.com/synheart-ai/synheart-auth-swift.git', :tag => "v#{s.version.to_s}" }
   s.source_files     = 'Sources/SynheartAuth/**/*.swift'
   s.frameworks       = 'Security', 'DeviceCheck', 'CryptoKit'
   s.ios.deployment_target = '15.0'
