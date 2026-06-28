@@ -7,6 +7,35 @@ import DeviceCheck
 
 private let ffiLog = Logger(subsystem: "ai.synheart.auth", category: "SynheartFFI")
 
+/// Hard cap on how long `synheart_native_get_attestation` blocks waiting for
+/// App Attest to resolve. App Attest normally returns an error rather than
+/// hanging, but `generateKey`/`attestKey` are network-backed and can stall on
+/// a degraded connection or an unresponsive attestation service. Bounding the
+/// wait keeps a stalled call from parking the calling thread indefinitely so
+/// registration can fail fast and fall back / retry.
+private let attestationTimeoutSeconds = 30
+
+/// Reference-counted result holder shared with the detached attestation Task.
+///
+/// A class (not an `UnsafeMutablePointer`) so it stays alive as long as the
+/// Task closure retains it. If the bounded wait below times out and the caller
+/// returns, the Task may still complete and write its result — into a
+/// still-alive object that nobody reads, rather than freed memory.
+private final class AttestationResultBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: (Data, String)?
+
+    func set(_ v: (Data, String)?) {
+        lock.lock(); defer { lock.unlock() }
+        value = v
+    }
+
+    func get() -> (Data, String)? {
+        lock.lock(); defer { lock.unlock() }
+        return value
+    }
+}
+
 /// C-ABI exports consumed by the native runtime's FFI bridge.
 ///
 /// Dart resolves these via `DynamicLibrary.process()` and hands the function
@@ -192,12 +221,7 @@ public func synheart_native_get_attestation(
     // DispatchSemaphore wait can't starve the cooperative pool.
     let cachedKeyId = loadAppAttestKeyId(deviceId: id)
     let semaphore = DispatchSemaphore(value: 0)
-    let box = UnsafeMutablePointer<(Data, String)?>.allocate(capacity: 1)
-    box.initialize(to: nil)
-    defer {
-        box.deinitialize(count: 1)
-        box.deallocate()
-    }
+    let box = AttestationResultBox()
     Task.detached(priority: .userInitiated) {
         defer { semaphore.signal() }
         do {
@@ -208,13 +232,20 @@ public func synheart_native_get_attestation(
                 keyId = try await DCAppAttestService.shared.generateKey()
             }
             let att = try await DCAppAttestService.shared.attestKey(keyId, clientDataHash: clientDataHash)
-            box.pointee = (att, keyId)
+            box.set((att, keyId))
         } catch {
-            box.pointee = nil
+            box.set(nil)
         }
     }
-    semaphore.wait()
-    guard let (blob, keyId) = box.pointee else { return nil }
+    // Bounded wait: a stalled App Attest call must not park this thread forever
+    // (see attestationTimeoutSeconds). On timeout we abandon the wait and return
+    // nil; the detached Task keeps a strong reference to `box`, so a late write
+    // is harmless.
+    guard semaphore.wait(timeout: .now() + .seconds(attestationTimeoutSeconds)) == .success else {
+        ffiLog.error("[SynheartFFI] get_attestation: App Attest timed out after \(attestationTimeoutSeconds, privacy: .public)s — returning nil")
+        return nil
+    }
+    guard let (blob, keyId) = box.get() else { return nil }
     if cachedKeyId == nil {
         _ = storeAppAttestKeyId(keyId, deviceId: id)
     }

@@ -7,6 +7,36 @@ import DeviceCheck
 import UIKit
 #endif
 
+/// Hard cap on the App Attest calls in `DeviceRegistrar.fetchAttestation`.
+/// App Attest normally returns an error rather than hanging, but the
+/// network-backed `generateKey`/`attestKey` can stall on a degraded connection
+/// or an unresponsive attestation service; bounding the wait keeps a stalled
+/// call from suspending registration indefinitely so it can fail fast.
+private let attestationTimeoutSeconds: UInt64 = 30
+
+private struct AttestationTimeoutError: Error {}
+
+/// Runs `operation`, throwing `AttestationTimeoutError` if it does not finish
+/// within `seconds`. The losing child task is cancelled; a non-cancellable
+/// in-flight App Attest call keeps running but its result is discarded.
+private func withAttestationTimeout<T: Sendable>(
+    seconds: UInt64,
+    _ operation: @escaping @Sendable () async throws -> T
+) async throws -> T {
+    try await withThrowingTaskGroup(of: T.self) { group in
+        group.addTask { try await operation() }
+        group.addTask {
+            try await Task.sleep(nanoseconds: seconds * 1_000_000_000)
+            throw AttestationTimeoutError()
+        }
+        defer { group.cancelAll() }
+        guard let result = try await group.next() else {
+            throw AttestationTimeoutError()
+        }
+        return result
+    }
+}
+
 /// Orchestrates device registration and key rotation flows.
 final class DeviceRegistrar: @unchecked Sendable {
     private let keyManager: KeyManaging
@@ -272,20 +302,25 @@ final class DeviceRegistrar: @unchecked Sendable {
         }
 
         do {
-            let keyId = try await DCAppAttestService.shared.generateKey()
-            // The server binds the attestation to (challenge, public_key) using:
-            // bindingHex = hex(SHA256(challenge || public_key))  // 64-char lowercase hex string
-            // clientDataHash = SHA256(utf8(bindingHex))          // 32 bytes
-            let bindingInput = challenge + publicKey
-            let bindingDigest = SHA256.hash(data: Data(bindingInput.utf8))
-            let bindingHex = bindingDigest.compactMap { String(format: "%02x", $0) }.joined()
-            let clientDataHash = Data(SHA256.hash(data: Data(bindingHex.utf8)))
+            return try await withAttestationTimeout(seconds: attestationTimeoutSeconds) {
+                let keyId = try await DCAppAttestService.shared.generateKey()
+                // The server binds the attestation to (challenge, public_key) using:
+                // bindingHex = hex(SHA256(challenge || public_key))  // 64-char lowercase hex string
+                // clientDataHash = SHA256(utf8(bindingHex))          // 32 bytes
+                let bindingInput = challenge + publicKey
+                let bindingDigest = SHA256.hash(data: Data(bindingInput.utf8))
+                let bindingHex = bindingDigest.compactMap { String(format: "%02x", $0) }.joined()
+                let clientDataHash = Data(SHA256.hash(data: Data(bindingHex.utf8)))
 
-            let attestation = try await DCAppAttestService.shared.attestKey(
-                keyId,
-                clientDataHash: clientDataHash
-            )
-            return attestation.base64EncodedString()
+                let attestation = try await DCAppAttestService.shared.attestKey(
+                    keyId,
+                    clientDataHash: clientDataHash
+                )
+                return attestation.base64EncodedString()
+            }
+        } catch is AttestationTimeoutError {
+            logger.warning("App Attest timed out after \(attestationTimeoutSeconds)s (non-fatal)")
+            return nil
         } catch {
             logger.warning("App Attest failed (non-fatal): \(error.localizedDescription)")
             return nil
