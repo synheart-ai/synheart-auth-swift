@@ -75,13 +75,95 @@ private func ffiKeychainQuery(service: String, deviceId: String) -> [String: Any
     ]
 }
 
-private func loadEnclaveKey(deviceId: String) -> SecureEnclave.P256.Signing.PrivateKey? {
-    var q = ffiKeychainQuery(service: ffiKeyService, deviceId: deviceId)
+// MARK: - Keychain reads: absent vs. unavailable
+//
+// Every C callback here can express only two outcomes — a pointer or NULL, a
+// 1 or a 0 — and the runtime reads the negative one as "no such item": NULL
+// from `secure_load` means "fresh install, mint a new storage master key";
+// 0 from `key_exists` during identity restore means "the platform key is
+// gone, this device is unregistered". Collapsing a *failed* read (device
+// still locked before first unlock, `securityd` not ready right after boot)
+// into that negative is what turned a transient Keychain state into a
+// re-minted master key over the existing one, or a re-registration under a
+// fresh identity. So reads are classified into three outcomes first, and
+// only genuine absence crosses the boundary as the negative.
+
+enum KeychainReadOutcome: Equatable {
+    case found(Data)
+    case absent
+    case unavailable(OSStatus)
+}
+
+/// Bounded retry budget for a transiently unavailable Keychain. Total wait is
+/// ~1.5 s (100 + 200 + 400 + 800 ms): short enough to hold the runtime mutex
+/// during `set_storage_callbacks` / `set_crypto_callbacks` without tripping a
+/// launch watchdog, long enough to ride out the unlock transition and the
+/// occasional `errSecNotAvailable` right after boot.
+let keychainReadMaxAttempts = 5
+private let keychainReadInitialBackoffMicros: UInt32 = 100_000
+
+func keychainReadOnce(_ query: [String: Any]) -> KeychainReadOutcome {
+    var q = query
     q[kSecReturnData as String] = true
+    q[kSecMatchLimit as String] = kSecMatchLimitOne
     var item: AnyObject?
-    guard SecItemCopyMatching(q as CFDictionary, &item) == errSecSuccess,
-          let data = item as? Data else { return nil }
-    return try? SecureEnclave.P256.Signing.PrivateKey(dataRepresentation: data)
+    let status = SecItemCopyMatching(q as CFDictionary, &item)
+    if status == errSecItemNotFound { return .absent }
+    guard status == errSecSuccess, let data = item as? Data else {
+        return .unavailable(status)
+    }
+    return .found(data)
+}
+
+/// Statuses worth waiting on: the item may well exist, the store just cannot
+/// serve it right now. Anything else (bad params, entitlement, decode) is
+/// reported immediately.
+func keychainStatusIsTransient(_ status: OSStatus) -> Bool {
+    switch status {
+    case errSecInteractionNotAllowed,  // device locked / before first unlock
+         errSecNotAvailable,           // securityd not ready
+         errSecIO:
+        return true
+    default:
+        return false
+    }
+}
+
+/// `keychainReadOnce` with a bounded backoff on transient failures. Never
+/// converts a failure into `.absent`. `what` names the caller in the log.
+func keychainReadWithRetry(_ query: [String: Any], what: String) -> KeychainReadOutcome {
+    var backoff = keychainReadInitialBackoffMicros
+    for attempt in 1...keychainReadMaxAttempts {
+        let outcome = keychainReadOnce(query)
+        guard case .unavailable(let status) = outcome,
+              keychainStatusIsTransient(status),
+              attempt < keychainReadMaxAttempts else {
+            return outcome
+        }
+        ffiLog.error("[SynheartFFI] \(what, privacy: .public): Keychain transiently unavailable (OSStatus \(status, privacy: .public)), retry \(attempt, privacy: .public)/\(keychainReadMaxAttempts - 1, privacy: .public)")
+        usleep(backoff)
+        backoff *= 2
+    }
+    // Unreachable: the loop returns on its last iteration.
+    return .absent
+}
+
+/// The Secure Enclave key for `deviceId`, or nil when there is none.
+///
+/// A Keychain that cannot be read right now also yields nil — `key_exists`
+/// and `sign_bytes` have no way to say "try again" — but only after the
+/// bounded retry above, and with the status logged, so a locked-device
+/// launch no longer reads silently as "no key" and re-registers the device.
+private func loadEnclaveKey(deviceId: String) -> SecureEnclave.P256.Signing.PrivateKey? {
+    switch keychainReadWithRetry(ffiKeychainQuery(service: ffiKeyService, deviceId: deviceId), what: "enclave key") {
+    case .found(let data):
+        return try? SecureEnclave.P256.Signing.PrivateKey(dataRepresentation: data)
+    case .absent:
+        return nil
+    case .unavailable(let status):
+        ffiLog.error("[SynheartFFI] enclave key for id=\(deviceId, privacy: .public): Keychain unavailable (OSStatus \(status, privacy: .public)) after \(keychainReadMaxAttempts, privacy: .public) attempts — reporting no key, which the runtime cannot tell from absent")
+        return nil
+    }
 }
 
 private func storeEnclaveKey(_ key: SecureEnclave.P256.Signing.PrivateKey, deviceId: String) -> Bool {
@@ -102,13 +184,10 @@ private func deleteEnclaveKey(deviceId: String) -> Bool {
 /// regeneration against Apple's quota and any risk of switching identities
 /// between callbacks within one registration flow).
 private func loadAppAttestKeyId(deviceId: String) -> String? {
-    var q = ffiKeychainQuery(service: ffiAppAttestKeyIdService, deviceId: deviceId)
-    q[kSecReturnData as String] = true
-    var item: AnyObject?
-    guard SecItemCopyMatching(q as CFDictionary, &item) == errSecSuccess,
-          let data = item as? Data,
-          let s = String(data: data, encoding: .utf8) else { return nil }
-    return s
+    guard case .found(let data) = keychainReadWithRetry(
+        ffiKeychainQuery(service: ffiAppAttestKeyIdService, deviceId: deviceId), what: "app-attest key id"
+    ) else { return nil }
+    return String(data: data, encoding: .utf8)
 }
 
 private func storeAppAttestKeyId(_ keyId: String, deviceId: String) -> Bool {
@@ -320,17 +399,29 @@ public func synheart_native_secure_load(
         kSecClass as String: kSecClassGenericPassword,
         kSecAttrService as String: svc,
         kSecAttrAccount as String: k,
-        kSecReturnData as String: true,
-        kSecMatchLimit as String: kSecMatchLimitOne,
     ]
-    var item: AnyObject?
-    let status = SecItemCopyMatching(q as CFDictionary, &item)
-    guard status == errSecSuccess,
-          let data = item as? Data,
-          let s = String(data: data, encoding: .utf8) else {
+    // NULL ONLY for a genuinely absent item. The C signature has no error
+    // channel, so a Keychain that still cannot be read after the bounded retry
+    // ALSO returns NULL. On a runtime >= 0.31.1 the provisioning marker turns
+    // that into ERR_SECURE_STORAGE_UNAVAILABLE (retryable) instead of a
+    // re-minted storage master key; on an older runtime the re-mint — which
+    // orphans every blob sealed so far — remains (SDK-CONTRACT-CHANGES §4.4).
+    switch keychainReadWithRetry(q, what: "secure_load(\(svc), \(k))") {
+    case .found(let data):
+        guard let s = String(data: data, encoding: .utf8) else {
+            // The item exists but is not the UTF-8 the runtime wrote. Not
+            // absent — reporting it as such would re-mint over a real, if
+            // unreadable, key.
+            ffiLog.error("[SynheartFFI] secure_load(\(svc, privacy: .public), \(k, privacy: .public)): item is not UTF-8 — returning NULL, which the runtime cannot tell from absent")
+            return nil
+        }
+        return cString(s)
+    case .absent:
+        return nil
+    case .unavailable(let status):
+        ffiLog.error("[SynheartFFI] secure_load(\(svc, privacy: .public), \(k, privacy: .public)): Keychain unavailable (OSStatus \(status, privacy: .public)) after \(keychainReadMaxAttempts, privacy: .public) attempts — returning NULL, which the runtime cannot tell from absent")
         return nil
     }
-    return cString(s)
 }
 
 @_cdecl("synheart_native_secure_delete")
