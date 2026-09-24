@@ -1,6 +1,6 @@
 Pod::Spec.new do |s|
   s.name             = 'SynheartAuth'
-  s.version          = '0.1.1'
+  s.version          = '0.1.2'
   s.summary          = 'Synheart device authentication SDK for iOS.'
   s.description      = <<~DESC
     Native iOS SDK for Synheart device authentication: Secure Enclave P-256
