@@ -5,6 +5,84 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed — an interrupted registration no longer blocks registration forever
+
+- **A registration killed mid-flow was permanent.** The state is persisted in
+  the Keychain, and `registerDevice` refused anything but `unregistered` /
+  `keyInvalid` with `registrationInProgress`. An app killed while the state
+  was `challengeReceived`, `keyReady` or `registering` could therefore never
+  register again without `resetDeviceIdentity`. The same applied to a key
+  rotation killed while `registering`, which also made `rotateKey` throw
+  `notRegistered`.
+  `registrationInProgress` is now decided by a **process-wide** in-flight
+  claim (shared across `configure` calls, which build a new registrar each
+  time). An intermediate state on disk with no claim in this process belongs
+  to a dead process and is recovered before the new attempt:
+  - registration → the half-made key is deleted and the state returns to
+    what it was before the attempt (`unregistered` or `keyInvalid`); the call
+    then runs a fresh registration with a new challenge and a new key;
+  - rotation → old + new key present: keep the key the server last
+    confirmed, discard the new one; only the new key present (the swap had
+    started, so the server had confirmed): finish it; no key: `keyInvalid`.
+  Register and rotate now record which operation is pending (and the state to
+  return to) in the Keychain metadata, so recovery does not have to guess;
+  states written by 0.1.2 are classified by whether a device id is stored.
+  If key presence cannot be read during recovery the call throws
+  `keychainError` and leaves the state untouched.
+
+### Fixed — a lost signing key can re-register
+
+- **`keyInvalidated` left the state `registered`**, so `registerDevice`
+  answered `alreadyRegistered` and the app could not recover without
+  `resetDeviceIdentity`. `keyInvalid` was in the state machine but never
+  entered. Now, when `signRequest` or `rotateKey` finds the signing key gone,
+  the keys are deleted and the state becomes `keyInvalid`; `isRegistered`
+  returns `false` and the next `registerDevice` re-registers under the same
+  device id. Skipped while a register/rotate in this process owns the state.
+- **A Keychain that cannot be read is no longer reported as an invalidated
+  key.** `KeyManager.sign` threw `keyInvalidated` for any failed key lookup,
+  including a locked device (`errSecInteractionNotAllowed`). With
+  invalidation now acting on the state, that would have destroyed a valid
+  identity, so only `errSecItemNotFound` means `keyInvalidated`; other
+  statuses throw `keychainError(OSStatus)` and change nothing.
+
+### Fixed — log privacy
+
+- The README promised privacy-annotated logs, but `AuthLogger` logged every
+  message with `privacy: .public`, so app ids, key tags, challenges, the
+  debug public key, server error bodies and error descriptions reached the
+  unified log unredacted. Call sites now log through `os.Logger` directly
+  with a privacy level per value: identifiers `.private(mask: .hash)`,
+  challenges / key material / server bodies / error descriptions `.private`,
+  status text, counts, HTTP and `OSStatus` codes `.public`. The FFI bridge's
+  device ids, Keychain account names and Secure Enclave error descriptions
+  are `.private` too. The network client logs the URL path rather than the
+  full URL.
+
+### Changed
+
+- `rotateKey` called while a registration for the same app id is running in
+  this process now throws `registrationInProgress` (was `notRegistered`).
+
+### Tests
+- `RegistrationRecoveryTests`: recovery from each intermediate state (with and
+  without the pending marker), a registration parked in `registering` whose
+  process dies, concurrent registrations in one process, the three
+  interrupted-rotation outcomes, an unreadable Keychain during recovery,
+  re-registration after key loss (via `signRequest` and via `rotateKey`), and
+  an unreadable key that must not invalidate the identity.
+- Test challenges expired on 2026-12-31; they now expire in 2099.
+
+### Known, not changed here
+- The signed message is `METHOD\nPATH\nTIMESTAMP\nBODY`: the nonce,
+  `X-App-ID`, `X-Device-ID` and the query string are not covered by the
+  signature. Changing that is a protocol change that needs the server.
+- CocoaPods trunk has only `0.1.0`; `0.1.1` and `0.1.2` were tagged but not
+  pushed. The podspec already matches `Package.swift` (iOS 15, macOS 13,
+  Swift 5.9).
+
 ## [0.1.2] - 2026-09-24
 
 ### Fixed — Keychain reads no longer report a failed read as "no such item"

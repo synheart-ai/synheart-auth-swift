@@ -82,7 +82,44 @@ let headers = try SynheartAuth.shared.signRequest(
 - **Algorithm**: ECDSA P-256 (secp256r1) with SHA-256
 - **Persistence**: Keychain (device ID, state, metadata)
 - **Thread Safety**: NSLock + `@unchecked Sendable` for async contexts
-- **Logging**: Apple `os.Logger` with privacy annotations
+- **Logging**: Apple `os.Logger` with per-value privacy annotations. App ids,
+  device ids, key tags, Keychain account names, challenges, public keys,
+  signatures, server error bodies and error descriptions are `.private`
+  (identifiers as `.private(mask: .hash)`, so lines still correlate); step
+  names, counts, HTTP status codes and `OSStatus` values are `.public`.
+
+### Registration state and recovery
+
+The registration state is persisted in the Keychain:
+`unregistered → challengeReceived → keyReady → registering → registered`,
+plus `keyInvalid`.
+
+- **Interrupted registration or rotation recovers on its own.** If the app is
+  killed mid-flow, the next `registerDevice` (or `rotateKey`) settles the
+  leftover state instead of failing. An interrupted registration is restarted
+  with a fresh challenge and a fresh key (the half-made key is deleted). An
+  interrupted rotation keeps the key the server last confirmed and discards
+  the new one — or, if the old key had already been replaced (the server had
+  confirmed), finishes the swap.
+- **`registrationInProgress`** now only means a `registerDevice`/`rotateKey`
+  for that app id is running *in this process*. It is safe to retry after
+  that call returns.
+- **`keyInvalidated`** is thrown when the signing key is provably gone (for
+  example after restoring a backup to a new device — the Secure Enclave key
+  does not migrate). The state moves to `keyInvalid`, `isRegistered` becomes
+  `false`, and the next `registerDevice` re-registers under the same device
+  id. You no longer need `resetDeviceIdentity` to recover.
+- A Keychain that cannot be read right now (device locked, `securityd` not
+  ready) surfaces as `keychainError(OSStatus)` and changes nothing; retry
+  later.
+
+```swift
+do {
+    headers = try SynheartAuth.shared.signRequest(appId: appId, method: "GET", path: "/v1/me")
+} catch SynheartAuthError.keyInvalidated {
+    _ = try await SynheartAuth.shared.registerDevice(appId: appId)  // re-registers
+}
+```
 
 ### Error Handling
 
@@ -93,12 +130,14 @@ All errors are cases of `SynheartAuthError`:
 | `.networkError(String)` | Network connectivity failure |
 | `.challengeExpired` | Registration challenge timed out |
 | `.attestationUnavailable` | Platform attestation not available |
-| `.keyInvalidated` | Key invalidated (biometric change, etc.) |
+| `.keyInvalidated` | Signing key is gone; state is now `keyInvalid` — call `registerDevice` to re-register |
 | `.clockSkew` | Client/server clock difference too large |
 | `.alreadyRegistered` | Device already registered |
 | `.notRegistered` | Device not yet registered |
 | `.notConfigured` | `configure()` not called |
-| `.keychainError(OSStatus)` | Keychain operation failed |
+| `.registrationInProgress` | A register/rotate for this app id is running in this process |
+| `.invalidStateTransition(from:to:)` | Invalid `DeviceAuthState` transition |
+| `.keychainError(OSStatus)` | Keychain operation failed or Keychain unreadable right now (retryable) |
 | `.cryptoError(String)` | Cryptographic operation failed |
 | `.serverError(code:message:)` | Server returned an error |
 
