@@ -55,7 +55,7 @@ public final class SynheartAuth: @unchecked Sendable {
     /// Configure the SDK with the auth service base URL. Must be called before any other method.
     public func configure(baseUrl: String) {
         guard let url = URL(string: baseUrl) else {
-            logger.error("Invalid base URL: \(baseUrl)")
+            logger.error("Invalid base URL: \(baseUrl, privacy: .public)")
             return
         }
 
@@ -65,7 +65,7 @@ public final class SynheartAuth: @unchecked Sendable {
         let network = AuthNetworkClient(baseUrl: url, clockSkew: clockSkew)
         self.signer = RequestSigner(keyManager: keyManager, storage: storageManager, clockSkew: clockSkew)
         self.registrar = DeviceRegistrar(keyManager: keyManager, storage: storageManager, network: network)
-        logger.info("SynheartAuth configured with base URL: \(baseUrl)")
+        logger.info("SynheartAuth configured with base URL: \(baseUrl, privacy: .public)")
     }
 
     // MARK: - Registration
@@ -79,6 +79,11 @@ public final class SynheartAuth: @unchecked Sendable {
     /// Register this device with the Synheart auth service.
     ///
     /// This is idempotent — if already registered, returns `.alreadyRegistered`.
+    ///
+    /// A registration or rotation left half-done by a previous process is
+    /// recovered first. Throws `registrationInProgress` only while another
+    /// register/rotate for `appId` runs in this process. From `keyInvalid`
+    /// (signing key gone) this re-registers.
     public func registerDevice(appId: String) async throws -> RegistrationResult {
         guard let registrar = getRegistrar() else {
             throw SynheartAuthError.notConfigured
@@ -131,7 +136,7 @@ public final class SynheartAuth: @unchecked Sendable {
     public func resetDeviceIdentity(appId: String) {
         keyManager.deleteKey(appId: appId)
         storageManager.deleteAll(appId: appId)
-        logger.warning("Device identity reset for \(appId)")
+        logger.warning("Device identity reset for \(appId, privacy: .private(mask: .hash))")
     }
 
     // MARK: - Clock Skew

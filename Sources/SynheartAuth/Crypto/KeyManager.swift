@@ -2,6 +2,19 @@ import Foundation
 import Security
 import CryptoKit
 
+/// What a Keychain lookup for a key established.
+///
+/// `absent` is the only outcome that proves the key is gone. A Keychain that
+/// cannot be read right now (device locked, `securityd` not ready) is
+/// `unavailable` — callers must not treat it as a dead key, because acting on
+/// that (marking the identity invalid, re-registering) would destroy an
+/// identity that is still valid.
+enum KeyPresence: Equatable, Sendable {
+    case present
+    case absent
+    case unavailable(OSStatus)
+}
+
 /// Protocol for key management, enabling test injection with software keys.
 protocol KeyManaging: Sendable {
     /// Generate a new P-256 key pair. Returns the public key as uncompressed X9.62 data.
@@ -18,6 +31,10 @@ protocol KeyManaging: Sendable {
     func deleteKey(appId: String)
     /// Check if a primary key exists.
     func hasKey(appId: String) -> Bool
+    /// Three-way lookup of the primary key.
+    func primaryKeyPresence(appId: String) -> KeyPresence
+    /// Three-way lookup of the `_next` (rotation) key.
+    func nextKeyPresence(appId: String) -> KeyPresence
 }
 
 /// Manages Secure Enclave P-256 keys, with software fallback for simulator/CI.
@@ -73,9 +90,9 @@ final class KeyManager: KeyManaging, @unchecked Sendable {
 
         if useSecureEnclave {
             attributes[kSecAttrTokenID as String] = kSecAttrTokenIDSecureEnclave
-            logger.debug("Generating Secure Enclave P-256 key: \(tag)")
+            logger.debug("Generating Secure Enclave P-256 key: \(tag, privacy: .private(mask: .hash))")
         } else {
-            logger.warning("Secure Enclave unavailable — using software P-256 key: \(tag)")
+            logger.warning("Secure Enclave unavailable — using software P-256 key: \(tag, privacy: .private(mask: .hash))")
         }
 
         var error: Unmanaged<CFError>?
@@ -93,7 +110,7 @@ final class KeyManager: KeyManaging, @unchecked Sendable {
             throw SynheartAuthError.cryptoError("Failed to export public key: \(msg)")
         }
 
-        logger.info("Generated key pair: \(tag) (\(publicKeyData.count) bytes public key)")
+        logger.info("Generated key pair: \(tag, privacy: .private(mask: .hash)) (\(publicKeyData.count, privacy: .public) bytes public key)")
         return publicKeyData
     }
 
@@ -119,7 +136,7 @@ final class KeyManager: KeyManaging, @unchecked Sendable {
         guard status == errSecSuccess else {
             throw SynheartAuthError.cryptoError("Key promotion failed: \(status)")
         }
-        logger.info("Promoted _next key to primary for app: \(appId)")
+        logger.info("Promoted _next key to primary for app: \(appId, privacy: .private(mask: .hash))")
     }
 
     func deleteNextKey(appId: String) {
@@ -129,8 +146,18 @@ final class KeyManager: KeyManaging, @unchecked Sendable {
     // MARK: - Signing
 
     func sign(data: Data, appId: String) throws -> Data {
-        guard let privateKey = loadPrivateKey(tag: tag(appId: appId)) else {
+        let privateKey: SecKey
+        switch lookupPrivateKey(tag: tag(appId: appId)) {
+        case .found(let key):
+            privateKey = key
+        case .absent:
+            // The only lookup outcome that proves the key is gone.
             throw SynheartAuthError.keyInvalidated
+        case .unavailable(let status):
+            // Locked device / securityd not ready: the key may well exist.
+            // Report a retryable Keychain error, never `keyInvalidated`.
+            logger.error("Signing key unreadable (OSStatus \(status, privacy: .public)) — not treating as invalidated")
+            throw SynheartAuthError.keychainError(status)
         }
 
         var error: Unmanaged<CFError>?
@@ -159,16 +186,38 @@ final class KeyManager: KeyManaging, @unchecked Sendable {
     func deleteKey(appId: String) {
         deleteKeyByTag(tag(appId: appId))
         deleteKeyByTag(nextTag(appId: appId))
-        logger.info("Deleted all keys for app: \(appId)")
+        logger.info("Deleted all keys for app: \(appId, privacy: .private(mask: .hash))")
     }
 
     func hasKey(appId: String) -> Bool {
-        loadPrivateKey(tag: tag(appId: appId)) != nil
+        primaryKeyPresence(appId: appId) == .present
+    }
+
+    func primaryKeyPresence(appId: String) -> KeyPresence {
+        presence(of: lookupPrivateKey(tag: tag(appId: appId)))
+    }
+
+    func nextKeyPresence(appId: String) -> KeyPresence {
+        presence(of: lookupPrivateKey(tag: nextTag(appId: appId)))
     }
 
     // MARK: - Private Helpers
 
-    private func loadPrivateKey(tag: String) -> SecKey? {
+    private enum KeyLookup {
+        case found(SecKey)
+        case absent
+        case unavailable(OSStatus)
+    }
+
+    private func presence(of lookup: KeyLookup) -> KeyPresence {
+        switch lookup {
+        case .found: return .present
+        case .absent: return .absent
+        case .unavailable(let status): return .unavailable(status)
+        }
+    }
+
+    private func lookupPrivateKey(tag: String) -> KeyLookup {
         let query: [String: Any] = [
             kSecClass as String: kSecClassKey,
             kSecAttrApplicationTag as String: Data(tag.utf8),
@@ -179,10 +228,11 @@ final class KeyManager: KeyManaging, @unchecked Sendable {
         var result: AnyObject?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
 
-        guard status == errSecSuccess else {
-            return nil
+        if status == errSecItemNotFound { return .absent }
+        guard status == errSecSuccess, let ref = result, CFGetTypeID(ref) == SecKeyGetTypeID() else {
+            return .unavailable(status == errSecSuccess ? errSecDecode : status)
         }
-        return result as! SecKey?  // swiftlint:disable:this force_cast
+        return .found(ref as! SecKey)  // swiftlint:disable:this force_cast
     }
 
     private func deleteKeyByTag(_ tag: String) {
@@ -246,9 +296,16 @@ final class MockKeyManager: KeyManaging, @unchecked Sendable {
         keys.removeValue(forKey: "\(appId)_next")
     }
 
+    /// When set, `sign` fails with `keychainError(status)` — a key that may
+    /// exist but cannot be read right now (locked device).
+    var signKeychainUnavailableStatus: OSStatus?
+
     func sign(data: Data, appId: String) throws -> Data {
         if signShouldFail {
             throw SynheartAuthError.keyInvalidated
+        }
+        if let status = signKeychainUnavailableStatus {
+            throw SynheartAuthError.keychainError(status)
         }
         return try withLock {
             guard let key = keys[appId] else {
@@ -268,5 +325,30 @@ final class MockKeyManager: KeyManaging, @unchecked Sendable {
 
     func hasKey(appId: String) -> Bool {
         withLock { keys[appId] != nil }
+    }
+
+    /// When set, every presence lookup reports `.unavailable(status)` —
+    /// simulates a locked device / unreadable Keychain.
+    var presenceUnavailableStatus: OSStatus?
+
+    func primaryKeyPresence(appId: String) -> KeyPresence {
+        if let status = presenceUnavailableStatus { return .unavailable(status) }
+        return withLock { keys[appId] != nil ? .present : .absent }
+    }
+
+    func nextKeyPresence(appId: String) -> KeyPresence {
+        if let status = presenceUnavailableStatus { return .unavailable(status) }
+        return withLock { keys["\(appId)_next"] != nil ? .present : .absent }
+    }
+
+    /// Test helper: drop only the primary key, as a device restore or a
+    /// Secure Enclave reset would.
+    func simulateKeyLoss(appId: String) {
+        withLock { _ = keys.removeValue(forKey: appId) }
+    }
+
+    /// Test helper: drop only the `_next` key.
+    func simulateNextKeyLoss(appId: String) {
+        withLock { _ = keys.removeValue(forKey: "\(appId)_next") }
     }
 }

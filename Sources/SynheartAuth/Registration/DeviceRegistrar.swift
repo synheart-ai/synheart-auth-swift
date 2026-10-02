@@ -44,30 +44,10 @@ final class DeviceRegistrar: @unchecked Sendable {
     private let network: AuthNetworking
     private let logger = AuthLogger.shared
 
-    /// In-flight register/rotate appIds, guarded by `inFlightLock`. Provides an
-    /// atomic test-and-set so two concurrent calls for the same appId can't both
-    /// proceed past the state guard.
-    private let inFlightLock = NSLock()
-    private var inFlight: Set<String> = []
-
     init(keyManager: KeyManaging, storage: StorageManaging, network: AuthNetworking) {
         self.keyManager = keyManager
         self.storage = storage
         self.network = network
-    }
-
-    private func claim(_ appId: String) -> Bool {
-        inFlightLock.lock()
-        defer { inFlightLock.unlock() }
-        if inFlight.contains(appId) { return false }
-        inFlight.insert(appId)
-        return true
-    }
-
-    private func release(_ appId: String) {
-        inFlightLock.lock()
-        inFlight.remove(appId)
-        inFlightLock.unlock()
     }
 
     // MARK: - Registration
@@ -80,10 +60,31 @@ final class DeviceRegistrar: @unchecked Sendable {
     /// 4. Send register request to server
     /// 5. Store device ID and update state
     /// 6. Return result
+    ///
+    /// An intermediate state persisted by a process that died mid-flow is
+    /// recovered first (see `recoverInterruptedOperation`); only a register or
+    /// rotate running in *this* process yields `registrationInProgress`.
     func register(appId: String) async throws -> RegistrationResult {
+        // Fast path, no claim needed: already registered.
+        if storage.loadState(appId: appId) == .registered,
+           let deviceId = storage.loadDeviceId(appId: appId) {
+            return RegistrationResult(status: .alreadyRegistered, deviceId: deviceId)
+        }
+
+        // Atomic test-and-set: only one in-flight register/rotate per appId
+        // in this process.
+        guard OperationClaims.claim(appId) else {
+            throw SynheartAuthError.registrationInProgress
+        }
+        defer { OperationClaims.release(appId) }
+
+        // Nothing else in this process is working on appId, so an
+        // intermediate state on disk is left over from a dead process.
+        try recoverInterruptedOperation(appId: appId)
+
         let currentState = storage.loadState(appId: appId)
 
-        // Guard: already registered
+        // Guard: already registered (possibly by a recovered rotation)
         if currentState == .registered {
             if let deviceId = storage.loadDeviceId(appId: appId) {
                 return RegistrationResult(status: .alreadyRegistered, deviceId: deviceId)
@@ -95,20 +96,18 @@ final class DeviceRegistrar: @unchecked Sendable {
             throw SynheartAuthError.registrationInProgress
         }
 
-        // Atomic test-and-set: only one in-flight register per appId.
-        guard claim(appId) else {
-            throw SynheartAuthError.registrationInProgress
-        }
-        defer { release(appId) }
-
         do {
+            // Record the operation before the first intermediate state, so a
+            // later process knows what to undo and which state to return to.
+            try beginPending(.register, prior: currentState, appId: appId)
+
             // Step 1: Fetch challenge (with retry)
-            logger.info("Step 1/6: Fetching challenge for \(appId)")
+            logger.info("Step 1/6: Fetching challenge for \(appId, privacy: .private(mask: .hash))")
             let challengeResponse = try await withRetry { [network] in
                 try await network.fetchChallenge(appId: appId)
             }
             try storage.saveState(.challengeReceived, appId: appId)
-            logger.info("Challenge received: \(challengeResponse.challenge) expiresAt=\(challengeResponse.expiresAt)")
+            logger.info("Challenge received: \(challengeResponse.challenge, privacy: .private) expiresAt=\(challengeResponse.expiresAt, privacy: .public)")
 
             // Validate challenge hasn't expired (90s TTL per RFC)
             if challengeResponse.isExpired {
@@ -124,9 +123,9 @@ final class DeviceRegistrar: @unchecked Sendable {
             let publicKeyBase64 = publicKeyData.base64EncodedString()
             // Per RFC-AUTH-MOBILE-0001 §13, public key material must not be logged in prod.
             #if DEBUG
-            logger.debug("Public key generated: bytes=\(publicKeyData.count) base64=\(publicKeyBase64)")
+            logger.debug("Public key generated: bytes=\(publicKeyData.count, privacy: .public) base64=\(publicKeyBase64, privacy: .private)")
             #else
-            logger.info("Public key generated: bytes=\(publicKeyData.count)")
+            logger.info("Public key generated: bytes=\(publicKeyData.count, privacy: .public)")
             #endif
             let proof = await fetchAttestation(
                 challenge: challengeResponse.challenge,
@@ -155,23 +154,24 @@ final class DeviceRegistrar: @unchecked Sendable {
             }
 
             // Step 5: Store result
-            // Per RFC-AUTH-MOBILE-0001 §13, device_id is logged truncated.
-            logger.info("Step 5/6: Storing device ID: \(response.deviceId.prefix(8))…")
+            logger.info("Step 5/6: Storing device ID: \(response.deviceId, privacy: .private(mask: .hash))")
             try storage.saveDeviceId(response.deviceId, appId: appId)
             try storage.saveState(.registered, appId: appId)
+            clearPending(appId: appId)
 
             // Step 6: Return
             logger.info("Step 6/6: Registration complete")
             return RegistrationResult(status: .success, deviceId: response.deviceId)
 
         } catch {
-            logger.error("Registration failed: \(error.localizedDescription)")
+            logger.error("Registration failed: \(error.localizedDescription, privacy: .private)")
             // Reset state on failure
             try? storage.saveState(
                 (currentState == .unregistered) ? .unregistered : .keyInvalid,
                 appId: appId
             )
             keyManager.deleteKey(appId: appId)
+            clearPending(appId: appId)
 
             if let authError = error as? SynheartAuthError {
                 return RegistrationResult(status: .failed, error: authError)
@@ -188,6 +188,16 @@ final class DeviceRegistrar: @unchecked Sendable {
     /// Rotate the device key. Creates a new key, has old key sign the new public key,
     /// sends to server, and atomically swaps on success.
     func rotateKey(appId: String) async throws -> RotationResult {
+        // Atomic test-and-set: serialize register/rotate per appId.
+        guard OperationClaims.claim(appId) else {
+            throw SynheartAuthError.registrationInProgress
+        }
+        defer { OperationClaims.release(appId) }
+
+        // A rotation interrupted by a dead process left `registering`; settle
+        // it so the device is `registered` (or `keyInvalid`) again.
+        try recoverInterruptedOperation(appId: appId)
+
         guard storage.loadState(appId: appId) == .registered else {
             throw SynheartAuthError.notRegistered
         }
@@ -196,19 +206,22 @@ final class DeviceRegistrar: @unchecked Sendable {
             throw SynheartAuthError.notRegistered
         }
 
-        // Atomic test-and-set: serialize register/rotate per appId.
-        guard claim(appId) else {
-            throw SynheartAuthError.registrationInProgress
-        }
-        defer { release(appId) }
-
+        var oldKeyIsGone = false
         do {
+            try beginPending(.rotate, prior: .registered, appId: appId)
+
             // Generate new key pair
             logger.info("Rotating key: generating new key pair")
             let newPublicKeyData = try keyManager.generateNextKeyPair(appId: appId)
 
             // Sign the new public key with the old key (proof of possession)
-            let oldKeySignature = try keyManager.sign(data: newPublicKeyData, appId: appId)
+            let oldKeySignature: Data
+            do {
+                oldKeySignature = try keyManager.sign(data: newPublicKeyData, appId: appId)
+            } catch SynheartAuthError.keyInvalidated {
+                oldKeyIsGone = true
+                throw SynheartAuthError.keyInvalidated
+            }
 
             // Transition to registering state for rotation
             try storage.saveState(.registering, appId: appId)
@@ -232,21 +245,125 @@ final class DeviceRegistrar: @unchecked Sendable {
             // Promote: atomic swap
             try keyManager.promoteNextKey(appId: appId)
             try storage.saveState(.registered, appId: appId)
+            clearPending(appId: appId)
 
-            logger.info("Key rotation complete for \(appId)")
+            logger.info("Key rotation complete for \(appId, privacy: .private(mask: .hash))")
             return RotationResult(status: .success)
 
         } catch {
-            logger.error("Key rotation failed: \(error.localizedDescription)")
+            logger.error("Key rotation failed: \(error.localizedDescription, privacy: .private)")
             // Cleanup: delete the _next key, restore state
             keyManager.deleteNextKey(appId: appId)
             try? storage.saveState(.registered, appId: appId)
+            clearPending(appId: appId)
+            if oldKeyIsGone {
+                // There is no key left to sign with: rotation cannot help,
+                // re-registration can.
+                invalidateRegisteredIdentity(appId: appId, keyManager: keyManager, storage: storage)
+            }
 
             if let authError = error as? SynheartAuthError {
                 return RotationResult(status: .failed, error: authError)
             }
             return RotationResult(status: .failed, error: .networkError(error.localizedDescription))
         }
+    }
+
+    // MARK: - Interrupted-operation recovery
+
+    /// Settle an intermediate state (`challengeReceived`, `keyReady`,
+    /// `registering`) written by a register/rotate whose process died.
+    ///
+    /// The caller must hold the `OperationClaims` claim for `appId`: that is
+    /// what proves the state is stale rather than owned by a live flow.
+    ///
+    /// - Interrupted **registration**: the challenge was never persisted and
+    ///   has a 90 s TTL, so the flow cannot be resumed. The half-made key —
+    ///   never confirmed to this device — is deleted (no orphaned Keychain
+    ///   key, no reuse of a key from an abandoned attempt) and the state goes
+    ///   back to what it was before the attempt (`unregistered` or
+    ///   `keyInvalid`). The caller then runs a fresh registration.
+    /// - Interrupted **rotation**: the primary key is only ever replaced after
+    ///   the server confirmed the rotation, so
+    ///   - primary + `_next` present → server outcome unknown; keep the
+    ///     confirmed primary, discard `_next`;
+    ///   - only `_next` present → promotion had started (server confirmed);
+    ///     finish it;
+    ///   - only primary present → rotation finished or never sent; keep it;
+    ///   - neither present → no key to sign with → `keyInvalid`.
+    ///
+    /// States written by 0.1.2 carry no pending-operation marker; `registering`
+    /// with a stored device id is then a rotation (0.1.2 only stored the
+    /// device id once registration succeeded), anything else a registration.
+    ///
+    /// Throws `keychainError` if key presence cannot be read right now; the
+    /// state is then left untouched for a later attempt.
+    func recoverInterruptedOperation(appId: String) throws {
+        let state = storage.loadState(appId: appId)
+        let metadata = storage.loadMetadata(appId: appId)
+        let recorded = metadata[PendingOperation.opKey].flatMap(PendingOperation.init(rawValue:))
+
+        switch state {
+        case .challengeReceived, .keyReady, .registering:
+            break
+        case .unregistered, .registered, .keyInvalid:
+            // Not mid-operation. A marker here is debris from a process that
+            // died just before its first, or just after its last, state write.
+            if recorded == .rotate { keyManager.deleteNextKey(appId: appId) }
+            if recorded != nil { clearPending(appId: appId) }
+            return
+        }
+
+        let operation = recorded
+            ?? ((state == .registering && storage.loadDeviceId(appId: appId) != nil) ? .rotate : .register)
+        let startedAt = metadata[PendingOperation.startedAtKey] ?? "unknown"
+        logger.warning("Recovering interrupted \(operation.rawValue, privacy: .public) left in state \(state.rawValue, privacy: .public) (started \(startedAt, privacy: .public))")
+
+        switch operation {
+        case .register:
+            let prior = metadata[PendingOperation.priorStateKey].flatMap(DeviceAuthState.init(rawValue:))
+            keyManager.deleteKey(appId: appId)
+            try storage.saveState(prior == .keyInvalid ? .keyInvalid : .unregistered, appId: appId)
+
+        case .rotate:
+            let primary = keyManager.primaryKeyPresence(appId: appId)
+            let next = keyManager.nextKeyPresence(appId: appId)
+            if case .unavailable(let status) = primary { throw SynheartAuthError.keychainError(status) }
+            if case .unavailable(let status) = next { throw SynheartAuthError.keychainError(status) }
+
+            switch (primary, next) {
+            case (.present, .present):
+                logger.warning("Interrupted rotation: server outcome unknown — keeping the confirmed key")
+                keyManager.deleteNextKey(appId: appId)
+                try storage.saveState(.registered, appId: appId)
+            case (.absent, .present):
+                logger.warning("Interrupted rotation: finishing the key promotion")
+                try keyManager.promoteNextKey(appId: appId)
+                try storage.saveState(.registered, appId: appId)
+            case (.present, _):
+                try storage.saveState(.registered, appId: appId)
+            default:
+                keyManager.deleteKey(appId: appId)
+                try storage.saveState(.keyInvalid, appId: appId)
+            }
+        }
+        clearPending(appId: appId)
+    }
+
+    private func beginPending(_ operation: PendingOperation, prior: DeviceAuthState, appId: String) throws {
+        var metadata = storage.loadMetadata(appId: appId)
+        metadata[PendingOperation.opKey] = operation.rawValue
+        metadata[PendingOperation.priorStateKey] = prior.rawValue
+        metadata[PendingOperation.startedAtKey] = ISO8601DateFormatter().string(from: Date())
+        try storage.saveMetadata(metadata, appId: appId)
+    }
+
+    private func clearPending(appId: String) {
+        var metadata = storage.loadMetadata(appId: appId)
+        let keys = [PendingOperation.opKey, PendingOperation.priorStateKey, PendingOperation.startedAtKey]
+        guard keys.contains(where: { metadata[$0] != nil }) else { return }
+        keys.forEach { metadata.removeValue(forKey: $0) }
+        try? storage.saveMetadata(metadata, appId: appId)
     }
 
     // MARK: - Retry
@@ -284,7 +401,7 @@ final class DeviceRegistrar: @unchecked Sendable {
                     let baseDelay: Double = 1.0 * pow(2.0, Double(attempt))
                     let jitter = Double.random(in: 0...0.5)
                     let delay = min(baseDelay + jitter, 30.0)
-                    logger.info("Retry \(attempt + 1)/\(maxAttempts - 1) after \(String(format: "%.1f", delay))s")
+                    logger.info("Retry \(attempt + 1, privacy: .public)/\(maxAttempts - 1, privacy: .public) after \(String(format: "%.1f", delay), privacy: .public)s")
                     try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                 }
             }
@@ -319,10 +436,10 @@ final class DeviceRegistrar: @unchecked Sendable {
                 return attestation.base64EncodedString()
             }
         } catch is AttestationTimeoutError {
-            logger.warning("App Attest timed out after \(attestationTimeoutSeconds)s (non-fatal)")
+            logger.warning("App Attest timed out after \(attestationTimeoutSeconds, privacy: .public)s (non-fatal)")
             return nil
         } catch {
-            logger.warning("App Attest failed (non-fatal): \(error.localizedDescription)")
+            logger.warning("App Attest failed (non-fatal): \(error.localizedDescription, privacy: .private)")
             return nil
         }
         #else

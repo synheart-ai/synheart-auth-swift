@@ -161,7 +161,7 @@ private func loadEnclaveKey(deviceId: String) -> SecureEnclave.P256.Signing.Priv
     case .absent:
         return nil
     case .unavailable(let status):
-        ffiLog.error("[SynheartFFI] enclave key for id=\(deviceId, privacy: .public): Keychain unavailable (OSStatus \(status, privacy: .public)) after \(keychainReadMaxAttempts, privacy: .public) attempts — reporting no key, which the runtime cannot tell from absent")
+        ffiLog.error("[SynheartFFI] enclave key for id=\(deviceId, privacy: .private(mask: .hash)): Keychain unavailable (OSStatus \(status, privacy: .public)) after \(keychainReadMaxAttempts, privacy: .public) attempts — reporting no key, which the runtime cannot tell from absent")
         return nil
     }
 }
@@ -238,7 +238,7 @@ public func synheart_native_generate_key(_ deviceId: UnsafePointer<CChar>?) -> U
         } else {
             let fresh = try SecureEnclave.P256.Signing.PrivateKey()
             guard storeEnclaveKey(fresh, deviceId: id) else {
-                ffiLog.error("[SynheartFFI] generate_key: keychain store failed for id=\(id, privacy: .public)")
+                ffiLog.error("[SynheartFFI] generate_key: keychain store failed for id=\(id, privacy: .private(mask: .hash))")
                 return nil
             }
             key = fresh
@@ -248,7 +248,7 @@ public func synheart_native_generate_key(_ deviceId: UnsafePointer<CChar>?) -> U
         let json = "{\"x\":\"\(x)\",\"y\":\"\(y)\"}"
         return cString(json)
     } catch {
-        ffiLog.error("[SynheartFFI] generate_key: SE keygen failed: \(error.localizedDescription, privacy: .public)")
+        ffiLog.error("[SynheartFFI] generate_key: SE keygen failed: \(error.localizedDescription, privacy: .private)")
         return nil
     }
 }
@@ -262,7 +262,7 @@ public func synheart_native_sign_bytes(
     guard let deviceId, let id = String(validatingUTF8: deviceId),
           let data, dataLen > 0 else { return nil }
     guard let key = loadEnclaveKey(deviceId: id) else {
-        ffiLog.error("[SynheartFFI] sign: no SE key for id=\(id, privacy: .public)")
+        ffiLog.error("[SynheartFFI] sign: no SE key for id=\(id, privacy: .private(mask: .hash))")
         return nil
     }
     do {
@@ -276,7 +276,7 @@ public func synheart_native_sign_bytes(
         // then converts to DER itself before sending to the server.
         return cString(base64Url(sig.rawRepresentation))
     } catch {
-        ffiLog.error("[SynheartFFI] sign: SE sign failed: \(error.localizedDescription, privacy: .public)")
+        ffiLog.error("[SynheartFFI] sign: SE sign failed: \(error.localizedDescription, privacy: .private)")
         return nil
     }
 }
@@ -406,20 +406,20 @@ public func synheart_native_secure_load(
     // that into ERR_SECURE_STORAGE_UNAVAILABLE (retryable) instead of a
     // re-minted storage master key; on an older runtime the re-mint — which
     // orphans every blob sealed so far — remains (SDK-CONTRACT-CHANGES §4.4).
-    switch keychainReadWithRetry(q, what: "secure_load(\(svc), \(k))") {
+    switch keychainReadWithRetry(q, what: "secure_load(\(svc))") {
     case .found(let data):
         guard let s = String(data: data, encoding: .utf8) else {
             // The item exists but is not the UTF-8 the runtime wrote. Not
             // absent — reporting it as such would re-mint over a real, if
             // unreadable, key.
-            ffiLog.error("[SynheartFFI] secure_load(\(svc, privacy: .public), \(k, privacy: .public)): item is not UTF-8 — returning NULL, which the runtime cannot tell from absent")
+            ffiLog.error("[SynheartFFI] secure_load(\(svc, privacy: .public), \(k, privacy: .private(mask: .hash))): item is not UTF-8 — returning NULL, which the runtime cannot tell from absent")
             return nil
         }
         return cString(s)
     case .absent:
         return nil
     case .unavailable(let status):
-        ffiLog.error("[SynheartFFI] secure_load(\(svc, privacy: .public), \(k, privacy: .public)): Keychain unavailable (OSStatus \(status, privacy: .public)) after \(keychainReadMaxAttempts, privacy: .public) attempts — returning NULL, which the runtime cannot tell from absent")
+        ffiLog.error("[SynheartFFI] secure_load(\(svc, privacy: .public), \(k, privacy: .private(mask: .hash))): Keychain unavailable (OSStatus \(status, privacy: .public)) after \(keychainReadMaxAttempts, privacy: .public) attempts — returning NULL, which the runtime cannot tell from absent")
         return nil
     }
 }

@@ -1,29 +1,19 @@
 import Foundation
 import os
 
-/// Thin wrapper around `os.Logger` for internal auth logging.
-struct AuthLogger {
-    private let logger: Logger
-
-    static let shared = AuthLogger()
-
-    private init() {
-        self.logger = Logger(subsystem: "ai.synheart.auth", category: "SynheartAuth")
-    }
-
-    func debug(_ message: String) {
-        logger.debug("\(message, privacy: .public)")
-    }
-
-    func info(_ message: String) {
-        logger.info("\(message, privacy: .public)")
-    }
-
-    func warning(_ message: String) {
-        logger.warning("\(message, privacy: .public)")
-    }
-
-    func error(_ message: String) {
-        logger.error("\(message, privacy: .public)")
-    }
+/// The SDK's `os.Logger`.
+///
+/// Call sites interpolate straight into `Logger`'s `OSLogMessage` so every
+/// value carries its own privacy annotation. Identifiers (app id, device id,
+/// key tags, Keychain account names), key material, signatures, nonces,
+/// challenges, server error bodies and error descriptions that can carry them
+/// are `.private` — redacted in logs collected off-device unless a debugger or
+/// a logging profile is attached. Use `.private(mask: .hash)` for identifiers
+/// so log lines can still be correlated. Status text, step names, counts,
+/// HTTP status codes and `OSStatus` values are `.public`.
+///
+/// (Through 0.1.2 this was a `String` wrapper that logged every message with
+/// `privacy: .public`, which made per-value annotation impossible.)
+enum AuthLogger {
+    static let shared = Logger(subsystem: "ai.synheart.auth", category: "SynheartAuth")
 }
