@@ -21,7 +21,7 @@ final class DeviceRegistrarTests: XCTestCase {
     func testRegisterHappyPath() async throws {
         network.challengeResult = .success(ChallengeResponse(
             challenge: "test-challenge-abc",
-            expiresAt: "2026-12-31T23:59:59Z"
+            expiresAt: "2099-12-31T23:59:59Z"
         ))
         network.registerResult = .success(RegisterResponse(
             deviceId: "device-uuid-123",
@@ -79,7 +79,7 @@ final class DeviceRegistrarTests: XCTestCase {
     func testRegisterServerFails() async throws {
         network.challengeResult = .success(ChallengeResponse(
             challenge: "challenge",
-            expiresAt: "2026-12-31T23:59:59Z"
+            expiresAt: "2099-12-31T23:59:59Z"
         ))
         network.registerResult = .failure(SynheartAuthError.serverError(
             code: "INVALID_ATTESTATION",

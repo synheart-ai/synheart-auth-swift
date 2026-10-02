@@ -43,7 +43,21 @@ final class RequestSigner: @unchecked Sendable {
         )
 
         // Sign the message
-        let signatureData = try keyManager.sign(data: message, appId: appId)
+        let signatureData: Data
+        do {
+            signatureData = try keyManager.sign(data: message, appId: appId)
+        } catch SynheartAuthError.keyInvalidated {
+            // The key is provably gone (Keychain answered "no such item" —
+            // a locked/unavailable Keychain surfaces as `keychainError`
+            // instead). Leave `registered` so `registerDevice` re-registers
+            // rather than answering `alreadyRegistered` forever. Skipped if a
+            // register/rotate in this process owns the state right now.
+            if OperationClaims.claim(appId) {
+                invalidateRegisteredIdentity(appId: appId, keyManager: keyManager, storage: storage)
+                OperationClaims.release(appId)
+            }
+            throw SynheartAuthError.keyInvalidated
+        }
         let signatureBase64 = signatureData.base64EncodedString()
 
         return SignedHeaders(

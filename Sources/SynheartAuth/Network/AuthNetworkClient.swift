@@ -59,7 +59,7 @@ final class AuthNetworkClient: AuthNetworking, @unchecked Sendable {
         request.setValue("true", forHTTPHeaderField: "X-Synheart-Dev-Mode")
         #endif
         request.httpBody = try encoder.encode(body)
-        logger.debug("HTTP POST \(url.absoluteString) bodyBytes=\(request.httpBody?.count ?? 0) (body redacted)")
+        logger.debug("HTTP POST \(url.path, privacy: .public) bodyBytes=\(request.httpBody?.count ?? 0, privacy: .public) (body redacted)")
 
         let (data, response) = try await performRequest(request)
 
@@ -67,14 +67,14 @@ final class AuthNetworkClient: AuthNetworking, @unchecked Sendable {
             throw SynheartAuthError.networkError("Invalid response type")
         }
 
-        logger.debug("HTTP \(httpResponse.statusCode) \(url.absoluteString) respBytes=\(data.count)")
+        logger.debug("HTTP \(httpResponse.statusCode, privacy: .public) \(url.path, privacy: .public) respBytes=\(data.count, privacy: .public)")
         if httpResponse.statusCode >= 200 && httpResponse.statusCode < 300 {
             return data
         }
 
         if let text = String(data: data, encoding: .utf8) {
             let preview = String(text.prefix(200))
-            logger.warning("HTTP error \(httpResponse.statusCode) preview=\(preview)")
+            logger.warning("HTTP error \(httpResponse.statusCode, privacy: .public) preview=\(preview, privacy: .private)")
         }
         if let errorResponse = try? decoder.decode(AuthErrorResponse.self, from: data) {
             if errorResponse.code == "CLOCK_SKEW", let serverTimestamp = errorResponse.serverTimestamp {
@@ -140,6 +140,10 @@ final class MockAuthNetworkClient: AuthNetworking, @unchecked Sendable {
     var lastRegisterRequest: RegisterRequest?
     var lastRotateRequest: RotateKeyRequest?
 
+    /// Awaited inside `registerDevice` before it answers — lets a test park a
+    /// registration in its `registering` step.
+    var beforeRegister: (@Sendable () async -> Void)?
+
     func fetchChallenge(appId: String) async throws -> ChallengeResponse {
         fetchChallengeCallCount += 1
         return try challengeResult.get()
@@ -148,6 +152,7 @@ final class MockAuthNetworkClient: AuthNetworking, @unchecked Sendable {
     func registerDevice(request: RegisterRequest) async throws -> RegisterResponse {
         registerCallCount += 1
         lastRegisterRequest = request
+        if let beforeRegister { await beforeRegister() }
         return try registerResult.get()
     }
 
