@@ -2,7 +2,7 @@
 
 # SynheartAuth (Swift)
 
-[![Version](https://img.shields.io/badge/version-0.1.0-blue.svg)](https://github.com/synheart-ai/synheart-auth-swift)
+[![Version](https://img.shields.io/badge/version-0.1.2-blue.svg)](https://github.com/synheart-ai/synheart-auth-swift)
 [![Swift](https://img.shields.io/badge/swift-5.9+-orange.svg)](https://swift.org)
 [![Platforms](https://img.shields.io/badge/platforms-iOS%2015%2B%20%7C%20macOS%2013%2B-lightgrey.svg)]()
 [![License](https://img.shields.io/badge/license-Apache%202.0-green.svg)](LICENSE)
@@ -33,7 +33,7 @@ Add to your `Package.swift`:
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/synheart-ai/synheart-auth-swift.git", from: "0.1.0"),
+    .package(url: "https://github.com/synheart-ai/synheart-auth-swift.git", from: "0.1.2"),
 ]
 ```
 
