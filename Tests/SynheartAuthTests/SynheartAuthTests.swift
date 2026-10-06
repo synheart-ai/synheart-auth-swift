@@ -25,7 +25,7 @@ final class SynheartAuthTests: XCTestCase {
     func testIsRegisteredReturnsTrueAfterRegistration() async throws {
         network.challengeResult = .success(ChallengeResponse(
             challenge: "challenge",
-            expiresAt: "2026-12-31T23:59:59Z"
+            expiresAt: "2099-12-31T23:59:59Z"
         ))
         network.registerResult = .success(RegisterResponse(
             deviceId: "device-123",
@@ -46,7 +46,7 @@ final class SynheartAuthTests: XCTestCase {
     func testGetDeviceIdAfterRegistration() async throws {
         network.challengeResult = .success(ChallengeResponse(
             challenge: "challenge",
-            expiresAt: "2026-12-31T23:59:59Z"
+            expiresAt: "2099-12-31T23:59:59Z"
         ))
         network.registerResult = .success(RegisterResponse(
             deviceId: "device-abc",
@@ -62,7 +62,7 @@ final class SynheartAuthTests: XCTestCase {
     func testSignRequestAfterRegistration() async throws {
         network.challengeResult = .success(ChallengeResponse(
             challenge: "challenge",
-            expiresAt: "2026-12-31T23:59:59Z"
+            expiresAt: "2099-12-31T23:59:59Z"
         ))
         network.registerResult = .success(RegisterResponse(
             deviceId: "device-123",
@@ -100,7 +100,7 @@ final class SynheartAuthTests: XCTestCase {
     func testResetDeviceIdentity() async throws {
         network.challengeResult = .success(ChallengeResponse(
             challenge: "challenge",
-            expiresAt: "2026-12-31T23:59:59Z"
+            expiresAt: "2099-12-31T23:59:59Z"
         ))
         network.registerResult = .success(RegisterResponse(
             deviceId: "device-123",
@@ -130,7 +130,7 @@ final class SynheartAuthTests: XCTestCase {
     func testRotateKeyAfterRegistration() async throws {
         network.challengeResult = .success(ChallengeResponse(
             challenge: "challenge",
-            expiresAt: "2026-12-31T23:59:59Z"
+            expiresAt: "2099-12-31T23:59:59Z"
         ))
         network.registerResult = .success(RegisterResponse(
             deviceId: "device-123",
@@ -162,7 +162,7 @@ final class SynheartAuthTests: XCTestCase {
 
         network.challengeResult = .success(ChallengeResponse(
             challenge: "challenge",
-            expiresAt: "2026-12-31T23:59:59Z"
+            expiresAt: "2099-12-31T23:59:59Z"
         ))
         network.registerResult = .success(RegisterResponse(
             deviceId: "device-app1",

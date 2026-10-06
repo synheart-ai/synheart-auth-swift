@@ -71,7 +71,7 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
         delete(key: key("device_id", appId: appId))
         delete(key: key("state", appId: appId))
         delete(key: key("metadata", appId: appId))
-        logger.info("Deleted all auth data for app: \(appId)")
+        logger.info("Deleted all auth data for app: \(appId, privacy: .private(mask: .hash))")
     }
 
     // MARK: - Keychain Primitives
@@ -90,7 +90,7 @@ final class StorageManager: StorageManaging, @unchecked Sendable {
 
         let status = SecItemAdd(query as CFDictionary, nil)
         guard status == errSecSuccess else {
-            logger.error("Keychain save failed for \(key): \(status)")
+            logger.error("Keychain save failed for \(key, privacy: .private(mask: .hash)): \(status, privacy: .public)")
             throw SynheartAuthError.keychainError(status)
         }
     }

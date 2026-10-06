@@ -8,6 +8,14 @@ import Foundation
 ///                                                              ↓
 ///                                                          keyInvalid → unregistered
 /// ```
+///
+/// `keyInvalid` is entered when the signing key is found gone (`signRequest`,
+/// `rotateKey`); `registerDevice` re-registers from it. An intermediate state
+/// (`challengeReceived`, `keyReady`, `registering`) left by a process that
+/// died mid-flow is settled by `DeviceRegistrar.recoverInterruptedOperation`
+/// before the next register/rotate — back to the pre-attempt state, or to
+/// `registered` / `keyInvalid` for a rotation. Those recovery writes are not
+/// routed through `canTransition`.
 public enum DeviceAuthState: String, Codable, Sendable, Equatable {
     case unregistered
     case challengeReceived
