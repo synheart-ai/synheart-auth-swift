@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — App Attest reuses its key when attestation fails
+
+- **Every failed attestation generated a new App Attest key.** The key ID was
+  stored only after a successful attestation, so a device whose attestation
+  kept failing asked Apple for a new key on each registration retry, and
+  Apple rate-limits key generation. The key ID is now stored as soon as it is
+  generated and reused on retry; only a key Apple reports invalid
+  (`DCError.invalidKey`) is discarded and replaced.
+- **Attestation failures were silent.** `synheart_native_get_attestation`
+  swallowed the error, so registration saw only a missing attestation. It now
+  logs the failure and its `DCError` code under `ai.synheart.auth` /
+  `SynheartFFI`.
+
 ## [0.1.3] - 2026-10-15
 
 ### Fixed — an interrupted registration no longer blocks registration forever
