@@ -294,9 +294,11 @@ public func synheart_native_get_attestation(
     #if canImport(DeviceCheck) && !targetEnvironment(simulator)
     guard DCAppAttestService.shared.isSupported else { return nil }
     // Rule 2 / 4: reuse a single App Attest keyId per device_id. Generate one
-    // on first call and persist in Keychain; every subsequent attestation for
-    // the same device_id reuses the same credential. Task.detached keeps the
-    // async DCAppAttestService calls off this caller thread so the
+    // on first call and persist it in Keychain at once, so a failed
+    // attestation retries with the same key instead of asking Apple for a new
+    // one each time (Apple rate-limits key generation). Only a key Apple
+    // reports invalid is discarded. Task.detached keeps the async
+    // DCAppAttestService calls off this caller thread so the
     // DispatchSemaphore wait can't starve the cooperative pool.
     let cachedKeyId = loadAppAttestKeyId(deviceId: id)
     let semaphore = DispatchSemaphore(value: 0)
@@ -309,10 +311,20 @@ public func synheart_native_get_attestation(
                 keyId = existing
             } else {
                 keyId = try await DCAppAttestService.shared.generateKey()
+                _ = storeAppAttestKeyId(keyId, deviceId: id)
             }
             let att = try await DCAppAttestService.shared.attestKey(keyId, clientDataHash: clientDataHash)
             box.set((att, keyId))
+        } catch let error as DCError where error.code == .invalidKey {
+            // The key can no longer be used; the next attempt generates one.
+            _ = deleteAppAttestKeyId(deviceId: id)
+            ffiLog.error("[SynheartFFI] get_attestation: App Attest key invalid (DCError \(error.code.rawValue, privacy: .public)) — discarded, a new key is generated next time")
+            box.set(nil)
         } catch {
+            // Without this the registration only sees a missing attestation
+            // and the reason is lost.
+            let code = (error as? DCError).map { "DCError \($0.code.rawValue)" } ?? "\(type(of: error))"
+            ffiLog.error("[SynheartFFI] get_attestation: App Attest failed (\(code, privacy: .public)): \(error.localizedDescription, privacy: .public)")
             box.set(nil)
         }
     }
@@ -324,10 +336,7 @@ public func synheart_native_get_attestation(
         ffiLog.error("[SynheartFFI] get_attestation: App Attest timed out after \(attestationTimeoutSeconds, privacy: .public)s — returning nil")
         return nil
     }
-    guard let (blob, keyId) = box.get() else { return nil }
-    if cachedKeyId == nil {
-        _ = storeAppAttestKeyId(keyId, deviceId: id)
-    }
+    guard let (blob, _) = box.get() else { return nil }
     let json = "{\"format\":\"apple-app-attest\",\"blob\":\"\(blob.base64EncodedString())\"}"
     return cString(json)
     #else
