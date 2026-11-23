@@ -6,6 +6,10 @@ on:
   pull_request:
     branches: [main]
 
+# Read-only token: these jobs only check out, build and test.
+permissions:
+  contents: read
+
 jobs:
   build-test:
     name: Build and test on macOS
