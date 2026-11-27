@@ -11,3 +11,7 @@ updates:
     groups:
       dependency-updates:
         patterns: ["*"]
+    ignore:
+      # Keep major upgrades separate for manual review.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
