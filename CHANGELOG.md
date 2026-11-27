@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-11-27
+
+### Added — key agreement for sync-space sharing
+- **`synheart_native_key_agreement(alias, peer, peer_len, out)`**: P-256 ECDH
+  with the Secure Enclave key under `alias` and an uncompressed peer point
+  (65 bytes, `0x04` first). Writes the 32-byte shared secret to `out` and
+  returns 0; returns 1 for a peer that is not a valid point, a missing key, or
+  an enclave error. Register it with
+  `synheart_core_sdk_set_key_agreement_callback` (core-runtime 0.47.0 and
+  later), after the crypto callbacks.
+- **`generate_key` for `<device_id>.space.agreement`** creates a Secure
+  Enclave key-agreement key, stored apart from the signing keys, so it can't
+  be used to sign. `key_exists` and `delete_key` follow the same alias. Every
+  other alias, `<device_id>.space.content` included, stays a signing key.
+
 ## [0.1.4] - 2026-11-23
 
 ### Fixed — App Attest reuses its key when attestation fails

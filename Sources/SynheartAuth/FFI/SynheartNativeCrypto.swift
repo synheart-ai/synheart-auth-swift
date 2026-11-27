@@ -66,6 +66,18 @@ private final class AttestationResultBox: @unchecked Sendable {
 
 private let ffiKeyService = "ai.synheart.auth.fficrypto"
 private let ffiAppAttestKeyIdService = "ai.synheart.auth.fficrypto.appattest"
+/// Key-agreement keys live under their own service, so a signing load never
+/// finds one and an agreement load never finds a signing key.
+private let ffiAgreementKeyService = "ai.synheart.auth.fficrypto.agreement"
+
+/// Suffix of the alias the runtime asks to use for P-256 key agreement
+/// (`<device_id>.space.agreement`). Every other alias is a signing key.
+let agreementAliasSuffix = ".space.agreement"
+
+/// Whether `alias` names a key-agreement key rather than a signing key.
+func isAgreementAlias(_ alias: String) -> Bool {
+    alias.hasSuffix(agreementAliasSuffix)
+}
 
 private func ffiKeychainQuery(service: String, deviceId: String) -> [String: Any] {
     return [
@@ -179,6 +191,50 @@ private func deleteEnclaveKey(deviceId: String) -> Bool {
     return s == errSecSuccess || s == errSecItemNotFound
 }
 
+/// The Secure Enclave key-agreement key for `alias`, or nil when there is none
+/// (or the Keychain cannot be read after the bounded retry, logged).
+private func loadAgreementKey(alias: String) -> SecureEnclave.P256.KeyAgreement.PrivateKey? {
+    switch keychainReadWithRetry(ffiKeychainQuery(service: ffiAgreementKeyService, deviceId: alias), what: "agreement key") {
+    case .found(let data):
+        return try? SecureEnclave.P256.KeyAgreement.PrivateKey(dataRepresentation: data)
+    case .absent:
+        return nil
+    case .unavailable(let status):
+        ffiLog.error("[SynheartFFI] agreement key for id=\(alias, privacy: .private(mask: .hash)): Keychain unavailable (OSStatus \(status, privacy: .public)) after \(keychainReadMaxAttempts, privacy: .public) attempts — reporting no key")
+        return nil
+    }
+}
+
+private func storeAgreementKey(_ key: SecureEnclave.P256.KeyAgreement.PrivateKey, alias: String) -> Bool {
+    SecItemDelete(ffiKeychainQuery(service: ffiAgreementKeyService, deviceId: alias) as CFDictionary)
+    var attrs = ffiKeychainQuery(service: ffiAgreementKeyService, deviceId: alias)
+    attrs[kSecValueData as String] = key.dataRepresentation
+    attrs[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+    return SecItemAdd(attrs as CFDictionary, nil) == errSecSuccess
+}
+
+private func deleteAgreementKey(alias: String) -> Bool {
+    let s = SecItemDelete(ffiKeychainQuery(service: ffiAgreementKeyService, deviceId: alias) as CFDictionary)
+    return s == errSecSuccess || s == errSecItemNotFound
+}
+
+/// The peer's public key from an uncompressed P-256 point (65 bytes, `0x04`
+/// first), or nil when it is not one or is not on the curve.
+func agreementPeerKey(_ bytes: Data) -> P256.KeyAgreement.PublicKey? {
+    guard bytes.count == 65, bytes.first == 0x04 else { return nil }
+    return try? P256.KeyAgreement.PublicKey(x963Representation: bytes)
+}
+
+/// Copies an ECDH shared secret (the 32-byte x coordinate) into `out`.
+/// False when it is not 32 bytes.
+func writeSharedSecret(_ secret: SharedSecret, to out: UnsafeMutablePointer<UInt8>) -> Bool {
+    secret.withUnsafeBytes { raw -> Bool in
+        guard raw.count == 32, let base = raw.baseAddress else { return false }
+        out.update(from: base.assumingMemoryBound(to: UInt8.self), count: 32)
+        return true
+    }
+}
+
 /// Rule 2 / 4: persist a stable App Attest keyId per device_id so every
 /// `get_attestation` call reuses the same credential (avoiding both per-call
 /// regeneration against Apple's quota and any risk of switching identities
@@ -228,6 +284,7 @@ private func splitUncompressedPoint(_ data: Data) -> (String, String)? {
 @_cdecl("synheart_native_generate_key")
 public func synheart_native_generate_key(_ deviceId: UnsafePointer<CChar>?) -> UnsafeMutablePointer<CChar>? {
     guard let deviceId, let id = String(validatingUTF8: deviceId) else { return nil }
+    if isAgreementAlias(id) { return generateAgreementKey(alias: id) }
     do {
         // Rule 1: load-or-create. If an SE key already exists for this
         // device_id we reuse it so every callback (generate_key, sign_bytes)
@@ -250,6 +307,63 @@ public func synheart_native_generate_key(_ deviceId: UnsafePointer<CChar>?) -> U
     } catch {
         ffiLog.error("[SynheartFFI] generate_key: SE keygen failed: \(error.localizedDescription, privacy: .private)")
         return nil
+    }
+}
+
+/// `generate_key` for a `*.space.agreement` alias: a Secure Enclave
+/// key-agreement key, load-or-create like the signing keys.
+private func generateAgreementKey(alias: String) -> UnsafeMutablePointer<CChar>? {
+    do {
+        let key: SecureEnclave.P256.KeyAgreement.PrivateKey
+        if let existing = loadAgreementKey(alias: alias) {
+            key = existing
+        } else {
+            let fresh = try SecureEnclave.P256.KeyAgreement.PrivateKey()
+            guard storeAgreementKey(fresh, alias: alias) else {
+                ffiLog.error("[SynheartFFI] generate_key: keychain store failed for agreement id=\(alias, privacy: .private(mask: .hash))")
+                return nil
+            }
+            key = fresh
+        }
+        guard let (x, y) = splitUncompressedPoint(key.publicKey.x963Representation) else { return nil }
+        return cString("{\"x\":\"\(x)\",\"y\":\"\(y)\"}")
+    } catch {
+        ffiLog.error("[SynheartFFI] generate_key: SE agreement keygen failed: \(error.localizedDescription, privacy: .private)")
+        return nil
+    }
+}
+
+/// P-256 ECDH for space sharing (`synheart_core_sdk_set_key_agreement_callback`).
+///
+/// Agrees between the Secure Enclave key under `alias` (a `*.space.agreement`
+/// key from `generate_key`) and `peer`, an uncompressed P-256 point (65 bytes,
+/// `0x04` first), and writes the 32-byte shared secret (the x coordinate) to
+/// `out`. Returns 0 on success, 1 on any failure: a peer that is not a valid
+/// point, no such key, or the enclave refusing. The private key never leaves
+/// the enclave.
+@_cdecl("synheart_native_key_agreement")
+public func synheart_native_key_agreement(
+    _ alias: UnsafePointer<CChar>?,
+    _ peer: UnsafePointer<UInt8>?,
+    _ peerLen: Int,
+    _ out: UnsafeMutablePointer<UInt8>?
+) -> Int32 {
+    guard let alias, let id = String(validatingUTF8: alias),
+          let peer, let out else { return 1 }
+    guard let peerKey = agreementPeerKey(Data(bytes: peer, count: peerLen)) else {
+        ffiLog.error("[SynheartFFI] key_agreement: peer is not an uncompressed P-256 point (len=\(peerLen, privacy: .public))")
+        return 1
+    }
+    guard let key = loadAgreementKey(alias: id) else {
+        ffiLog.error("[SynheartFFI] key_agreement: no agreement key for id=\(id, privacy: .private(mask: .hash))")
+        return 1
+    }
+    do {
+        let secret = try key.sharedSecretFromKeyAgreement(with: peerKey)
+        return writeSharedSecret(secret, to: out) ? 0 : 1
+    } catch {
+        ffiLog.error("[SynheartFFI] key_agreement: SE agreement failed: \(error.localizedDescription, privacy: .private)")
+        return 1
     }
 }
 
@@ -347,12 +461,14 @@ public func synheart_native_get_attestation(
 @_cdecl("synheart_native_key_exists")
 public func synheart_native_key_exists(_ deviceId: UnsafePointer<CChar>?) -> Int32 {
     guard let deviceId, let id = String(validatingUTF8: deviceId) else { return 0 }
+    if isAgreementAlias(id) { return loadAgreementKey(alias: id) != nil ? 1 : 0 }
     return loadEnclaveKey(deviceId: id) != nil ? 1 : 0
 }
 
 @_cdecl("synheart_native_delete_key")
 public func synheart_native_delete_key(_ deviceId: UnsafePointer<CChar>?) -> Int32 {
     guard let deviceId, let id = String(validatingUTF8: deviceId) else { return 1 }
+    if isAgreementAlias(id) { return deleteAgreementKey(alias: id) ? 0 : 1 }
     // Rule 4: clear BOTH persisted mappings so the next registration for this
     // device_id starts clean. The App Attest key itself cannot be revoked via
     // the Apple API, but dropping the cached keyId means we won't try to
@@ -462,6 +578,7 @@ public enum SynheartNativeCryptoAnchor {
         synheart_native_get_attestation,
         synheart_native_key_exists,
         synheart_native_delete_key,
+        synheart_native_key_agreement,
         synheart_native_secure_store,
         synheart_native_secure_load,
         synheart_native_secure_delete,
